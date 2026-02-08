@@ -347,47 +347,60 @@ def cmd_bot(cfg: dict, args):
     log.info("Bot started, listening for commands (offset=%s)", offset)
     print("Bot started. Listening for Telegram commands... (Ctrl+C to stop)")
 
-    while True:
-        try:
-            updates = get_telegram_updates(tg_token, offset=offset)
-        except requests.RequestException as e:
-            log.error("Failed to get updates: %s", e)
-            time.sleep(5)
-            continue
+    try:
+        send_telegram(tg_token, chat_id,
+                      f"\U0001F419 Bot online ({GIT_SHA})")
+    except requests.RequestException as e:
+        log.warning("Failed to send startup banner: %s", e)
 
-        for update in updates:
-            update_id = update["update_id"]
-            offset = update_id + 1
-
-            msg = update.get("message", {})
-            msg_chat_id = str(msg.get("chat", {}).get("id", ""))
-            text = msg.get("text", "")
-
-            if msg_chat_id != chat_id:
-                log.warning("Ignoring message from unauthorized chat %s",
-                            msg_chat_id)
+    try:
+        while True:
+            try:
+                updates = get_telegram_updates(tg_token, offset=offset)
+            except requests.RequestException as e:
+                log.error("Failed to get updates: %s", e)
+                time.sleep(5)
                 continue
 
-            if not text:
-                continue
+            for update in updates:
+                update_id = update["update_id"]
+                offset = update_id + 1
 
-            # Check for pending command awaiting an argument
-            if not text.startswith("/"):
-                pending = db.get_setting("pending_command")
-                if pending and pending in ("threshold", "report"):
-                    db.set_setting("pending_command", "")
-                    text = f"/{pending} {text}"
-                else:
+                msg = update.get("message", {})
+                msg_chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "")
+
+                if msg_chat_id != chat_id:
+                    log.warning("Ignoring message from unauthorized chat %s",
+                                msg_chat_id)
                     continue
 
-            log.info("Received command: %s", text)
-            try:
-                handle_bot_command(cfg, db, text, chat_id, tg_token)
-            except requests.RequestException as e:
-                log.error("Failed to handle command: %s", e)
+                if not text:
+                    continue
 
-        if updates:
-            db.set_setting("telegram_update_offset", str(offset))
+                # Check for pending command awaiting an argument
+                if not text.startswith("/"):
+                    pending = db.get_setting("pending_command")
+                    if pending and pending in ("threshold", "report"):
+                        db.set_setting("pending_command", "")
+                        text = f"/{pending} {text}"
+                    else:
+                        continue
+
+                log.info("Received command: %s", text)
+                try:
+                    handle_bot_command(cfg, db, text, chat_id, tg_token)
+                except requests.RequestException as e:
+                    log.error("Failed to handle command: %s", e)
+
+            if updates:
+                db.set_setting("telegram_update_offset", str(offset))
+    finally:
+        try:
+            send_telegram(tg_token, chat_id, "\U0001F419 Bot shutting down")
+        except Exception:
+            pass
+        db.close()
 
 
 # ── Commands ─────────────────────────────────────────────────────────
