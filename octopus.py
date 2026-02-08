@@ -104,6 +104,73 @@ def output_result(data, headers: list[str] | None = None, as_json: bool = False)
         print("No data.")
 
 
+# ── Self-test ─────────────────────────────────────────────────────────
+
+def run_selftest(cfg: dict) -> list[str]:
+    """Run startup checks, return list of status lines with emoji."""
+    results = []
+
+    # API connectivity
+    if cfg.get("api_key"):
+        try:
+            api = OctopusAPI(cfg["api_key"])
+            gql_token = api.get_graphql_token()
+            device_id = cfg.get("device_id")
+            if device_id:
+                reading = api.get_live_demand(gql_token, device_id)
+                if reading:
+                    demand = float(reading["demand"])
+                    results.append(f"\u2705 API: {demand:.0f}W")
+                else:
+                    results.append("\u2705 API: ok (no telemetry)")
+            else:
+                results.append("\u2705 API: ok (no device)")
+        except Exception as e:
+            results.append(f"\u274c API: {e}")
+    else:
+        results.append("\u26a0\ufe0f API: no key configured")
+
+    # Crontab
+    try:
+        crontab = subprocess.check_output(
+            ["crontab", "-l"], stderr=subprocess.DEVNULL
+        ).decode()
+        cron_lines = [l for l in crontab.splitlines()
+                      if "octopus.py" in l and not l.startswith("#")]
+        if cron_lines:
+            results.append(f"\u2705 Cron: {len(cron_lines)} job(s)")
+        else:
+            results.append("\u274c Cron: no octopus jobs found")
+    except Exception:
+        results.append("\u274c Cron: unable to read crontab")
+
+    # Disk space
+    try:
+        st = os.statvfs("/")
+        free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+        if free_gb >= 1.0:
+            results.append(f"\u2705 Disk: {free_gb:.1f}GB free")
+        else:
+            results.append(f"\u26a0\ufe0f Disk: {free_gb:.1f}GB free")
+    except Exception as e:
+        results.append(f"\u274c Disk: {e}")
+
+    # CPU temperature
+    try:
+        temp_str = Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()
+        temp_c = int(temp_str) / 1000.0
+        if temp_c < 70:
+            results.append(f"\u2705 CPU: {temp_c:.0f}\u00b0C")
+        elif temp_c < 80:
+            results.append(f"\u26a0\ufe0f CPU: {temp_c:.0f}\u00b0C")
+        else:
+            results.append(f"\u274c CPU: {temp_c:.0f}\u00b0C")
+    except Exception:
+        results.append("\u2705 CPU: temp unavailable")
+
+    return results
+
+
 # ── Telegram alerts ──────────────────────────────────────────────────
 
 def send_telegram(token: str, chat_id: str, message: str):
@@ -352,8 +419,9 @@ def cmd_bot(cfg: dict, args):
     print("Bot started. Listening for Telegram commands... (Ctrl+C to stop)")
 
     try:
-        send_telegram(tg_token, chat_id,
-                      f"\U0001F419 Bot online ({GIT_SHA})")
+        checks = run_selftest(cfg)
+        banner = f"\U0001F419 Bot online ({GIT_SHA})\n" + "\n".join(checks)
+        send_telegram(tg_token, chat_id, banner)
     except requests.RequestException as e:
         log.warning("Failed to send startup banner: %s", e)
 
