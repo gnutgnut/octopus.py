@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -19,6 +20,14 @@ from octopus_db import OctopusDB
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_DIR / ".env"
+
+try:
+    GIT_SHA = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=PROJECT_DIR, stderr=subprocess.DEVNULL
+    ).decode().strip()
+except Exception:
+    GIT_SHA = "unknown"
 
 log = logging.getLogger("octopus")
 
@@ -268,6 +277,20 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
                         f"at {reading['readAt'][:16]}")
             except Exception as e:
                 log.warning("Failed to fetch demand for /status: %s", e)
+        # Cron jobs
+        try:
+            crontab = subprocess.check_output(
+                ["crontab", "-l"], stderr=subprocess.DEVNULL
+            ).decode()
+            cron_lines = [l.strip() for l in crontab.splitlines()
+                          if "octopus.py" in l and not l.startswith("#")]
+            if cron_lines:
+                lines.append("Cron jobs:")
+                for cl in cron_lines:
+                    lines.append(f"  {cl}")
+        except Exception:
+            pass
+        lines.append(f"Version: {GIT_SHA}")
         send_telegram(tg_token, chat_id, "\n".join(lines))
 
     elif cmd == "/help":
