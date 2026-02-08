@@ -37,6 +37,15 @@ CREATE TABLE IF NOT EXISTS sync_log (
     record_count  INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS alerts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    alerted_at    TEXT NOT NULL,
+    direction     TEXT NOT NULL,
+    prev_kwh      REAL NOT NULL,
+    curr_kwh      REAL NOT NULL,
+    threshold     REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_consumption_start ON consumption(interval_start);
 CREATE INDEX IF NOT EXISTS idx_unit_rates_from ON unit_rates(valid_from);
 CREATE INDEX IF NOT EXISTS idx_standing_charges_from ON standing_charges(valid_from);
@@ -223,6 +232,26 @@ class OctopusDB:
             (date_str, date_str),
         ).fetchone()
         return row["value_inc_vat"] if row else None
+
+    # ── Alert methods ───────────────────────────────────────────────
+
+    def log_alert(self, direction: str, prev_kwh: float, curr_kwh: float,
+                  threshold: float):
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO alerts (alerted_at, direction, prev_kwh, curr_kwh, threshold)
+               VALUES (?, ?, ?, ?, ?)""",
+            (now, direction, prev_kwh, curr_kwh, threshold),
+        )
+        self.conn.commit()
+        log.info("Logged %s alert: %.2f -> %.2f (threshold %.2f)",
+                 direction, prev_kwh, curr_kwh, threshold)
+
+    def last_alert(self) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM alerts ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
 
     def export_all(self) -> dict:
         """Export all table data as a dict for JSON serialisation."""

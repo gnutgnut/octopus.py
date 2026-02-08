@@ -9,6 +9,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv, set_key
 from tabulate import tabulate
 
@@ -44,6 +45,9 @@ def load_config(db_override: str | None = None) -> dict:
         "db_path": db_override or os.getenv("OCTOPUS_DB_PATH",
                                              str(PROJECT_DIR / "octopus.db")),
         "log_level": os.getenv("OCTOPUS_LOG_LEVEL", "INFO"),
+        "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
+        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID"),
+        "alert_threshold": float(os.getenv("OCTOPUS_ALERT_THRESHOLD", "1.0")),
     }
     return cfg
 
@@ -84,6 +88,70 @@ def output_result(data, headers: list[str] | None = None, as_json: bool = False)
             print(f"  {k}: {v}")
     else:
         print("No data.")
+
+
+# ── Telegram alerts ──────────────────────────────────────────────────
+
+def send_telegram(token: str, chat_id: str, message: str):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = requests.post(url, json={"chat_id": chat_id, "text": message},
+                         timeout=10)
+    resp.raise_for_status()
+    log.info("Telegram message sent to chat %s", chat_id)
+
+
+def check_usage_alerts(cfg: dict, db: OctopusDB):
+    """Check if daily usage crossed the threshold and send a Telegram alert."""
+    token = cfg.get("telegram_bot_token")
+    chat_id = cfg.get("telegram_chat_id")
+    if not token or not chat_id:
+        return
+
+    threshold = cfg["alert_threshold"]
+
+    # Get daily consumption for the last 3 complete days (exclude today)
+    period_from = days_ago(3)
+    period_to = days_ago(0)  # start of today = end of yesterday
+    daily = db.get_consumption_grouped(period_from, period_to, group="day")
+
+    if len(daily) < 2:
+        log.debug("Not enough daily data for alert check (%d days)", len(daily))
+        return
+
+    prev_day = daily[-2]
+    curr_day = daily[-1]
+    prev_kwh = prev_day["total_kwh"]
+    curr_kwh = curr_day["total_kwh"]
+
+    # Determine direction of transition
+    if prev_kwh < threshold and curr_kwh >= threshold:
+        direction = "high"
+    elif prev_kwh >= threshold and curr_kwh < threshold:
+        direction = "low"
+    else:
+        log.debug("No usage transition: %.2f -> %.2f (threshold %.2f)",
+                  prev_kwh, curr_kwh, threshold)
+        return
+
+    # Skip if the last alert was already this direction
+    last = db.last_alert()
+    if last and last["direction"] == direction:
+        log.debug("Skipping duplicate %s alert", direction)
+        return
+
+    # Build and send message
+    arrow = "\u2b06\ufe0f" if direction == "high" else "\u2b07\ufe0f"
+    label = "High" if direction == "high" else "Low"
+    msg = (f"{arrow} {label} usage alert\n"
+           f"{prev_day['period']}: {prev_kwh:.2f} kWh\n"
+           f"{curr_day['period']}: {curr_kwh:.2f} kWh\n"
+           f"Threshold: {threshold:.1f} kWh")
+
+    try:
+        send_telegram(token, chat_id, msg)
+        db.log_alert(direction, prev_kwh, curr_kwh, threshold)
+    except requests.RequestException as e:
+        log.error("Failed to send Telegram alert: %s", e)
 
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -164,6 +232,8 @@ def cmd_sync(cfg: dict, args):
 
     if not args.quiet:
         print("Sync complete.")
+
+    check_usage_alerts(cfg, db)
 
     db.close()
 
