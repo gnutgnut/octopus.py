@@ -50,6 +50,7 @@ def load_config(db_override: str | None = None) -> dict:
         "alert_threshold": float(os.getenv("OCTOPUS_ALERT_THRESHOLD", "1000")),
         "device_id": os.getenv("OCTOPUS_DEVICE_ID"),
         "telegram_report_demand": os.getenv("TELEGRAM_REPORT_DEMAND", "true").lower() == "true",
+        "report_demand_threshold": float(os.getenv("OCTOPUS_REPORT_DEMAND_THRESHOLD", "2000")),
     }
     return cfg
 
@@ -131,8 +132,8 @@ def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
     demand = float(reading["demand"])
     read_at = reading["readAt"]
 
-    # Optional: always report current demand
-    if cfg.get("telegram_report_demand"):
+    # Report demand when above reporting threshold
+    if cfg.get("telegram_report_demand") and demand >= cfg["report_demand_threshold"]:
         warn = "\u26a0\ufe0f " if demand >= 3000 else ""
         status_msg = f"{warn}Demand: {demand:.0f}W at {read_at[:16]}"
         try:
