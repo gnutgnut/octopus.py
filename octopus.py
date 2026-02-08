@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -115,6 +116,7 @@ def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
         log.debug("No OCTOPUS_DEVICE_ID configured, skipping live demand check")
         return
 
+    muted = db.get_setting("muted") == "true"
     threshold = cfg["alert_threshold"]
 
     # Fetch live demand via GraphQL
@@ -131,6 +133,11 @@ def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
 
     demand = float(reading["demand"])
     read_at = reading["readAt"]
+    log.info("Live demand: %.0fW at %s", demand, read_at[:16])
+
+    if muted:
+        log.info("Notifications muted, skipping Telegram sends")
+        return
 
     # Report demand when above reporting threshold
     if cfg.get("telegram_report_demand") and demand >= cfg["report_demand_threshold"]:
@@ -164,6 +171,198 @@ def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
         db.log_alert(direction, prev_demand, demand, threshold)
     except requests.RequestException as e:
         log.error("Failed to send Telegram alert: %s", e)
+
+
+# ── Telegram bot ──────────────────────────────────────────────────────
+
+def get_telegram_updates(token: str, offset: int | None = None,
+                         timeout: int = 30) -> list[dict]:
+    """Long-poll the Telegram getUpdates endpoint."""
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.get(url, params=params, timeout=timeout + 10)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", [])
+
+
+def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
+                       tg_token: str):
+    """Parse and dispatch a bot command, replying via Telegram."""
+    parts = text.strip().split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    # Strip @botname suffix from commands (e.g. /status@MyBot)
+    if "@" in cmd:
+        cmd = cmd.split("@")[0]
+    env_path = str(ENV_FILE)
+    db.set_setting("pending_command", "")
+
+    if cmd == "/threshold":
+        if not arg:
+            db.set_setting("pending_command", "threshold")
+            send_telegram(tg_token, chat_id, "Enter threshold in watts:")
+            return
+        try:
+            watts = int(arg)
+        except ValueError:
+            send_telegram(tg_token, chat_id, "Invalid number. Usage: /threshold <watts>")
+            return
+        set_key(env_path, "OCTOPUS_ALERT_THRESHOLD", str(watts))
+        cfg["alert_threshold"] = float(watts)
+        send_telegram(tg_token, chat_id, f"Alert threshold set to {watts}W")
+
+    elif cmd == "/report":
+        if not arg:
+            db.set_setting("pending_command", "report")
+            send_telegram(tg_token, chat_id, "Enter threshold in watts (or 'off'):")
+            return
+        if arg.lower() == "off":
+            set_key(env_path, "TELEGRAM_REPORT_DEMAND", "false")
+            cfg["telegram_report_demand"] = False
+            send_telegram(tg_token, chat_id, "Demand reporting disabled")
+        else:
+            try:
+                watts = int(arg)
+            except ValueError:
+                send_telegram(tg_token, chat_id,
+                              "Invalid value. Usage: /report <watts|off>")
+                return
+            set_key(env_path, "OCTOPUS_REPORT_DEMAND_THRESHOLD", str(watts))
+            set_key(env_path, "TELEGRAM_REPORT_DEMAND", "true")
+            cfg["report_demand_threshold"] = float(watts)
+            cfg["telegram_report_demand"] = True
+            send_telegram(tg_token, chat_id,
+                          f"Demand reporting enabled at {watts}W threshold")
+
+    elif cmd == "/mute":
+        db.set_setting("muted", "true")
+        send_telegram(tg_token, chat_id, "Notifications muted")
+
+    elif cmd == "/unmute":
+        db.set_setting("muted", "false")
+        send_telegram(tg_token, chat_id, "Notifications resumed")
+
+    elif cmd == "/status":
+        muted = db.get_setting("muted") == "true"
+        report = "on" if cfg.get("telegram_report_demand") else "off"
+        lines = [
+            "Current config:",
+            f"  Alert threshold: {cfg['alert_threshold']:.0f}W",
+            f"  Report demand: {report}",
+            f"  Report threshold: {cfg['report_demand_threshold']:.0f}W",
+            f"  Muted: {'yes' if muted else 'no'}",
+        ]
+        # Try to include latest demand reading
+        device_id = cfg.get("device_id")
+        if device_id and cfg.get("api_key"):
+            try:
+                api = OctopusAPI(cfg["api_key"])
+                gql_token = api.get_graphql_token()
+                reading = api.get_live_demand(gql_token, device_id)
+                if reading:
+                    lines.append(
+                        f"  Live demand: {float(reading['demand']):.0f}W "
+                        f"at {reading['readAt'][:16]}")
+            except Exception as e:
+                log.warning("Failed to fetch demand for /status: %s", e)
+        send_telegram(tg_token, chat_id, "\n".join(lines))
+
+    elif cmd == "/help":
+        send_telegram(tg_token, chat_id, "\n".join([
+            "Available commands:",
+            "  /threshold <watts> - set alert threshold",
+            "  /report <watts|off> - set demand report threshold or disable",
+            "  /mute - silence all notifications",
+            "  /unmute - resume notifications",
+            "  /status - show current config + live demand",
+            "  /help - show this message",
+        ]))
+
+    else:
+        send_telegram(tg_token, chat_id, "Unknown command. Send /help for usage.")
+
+
+def cmd_bot(cfg: dict, args):
+    """Run long-polling Telegram bot to accept commands."""
+    tg_token = cfg.get("telegram_bot_token")
+    chat_id = cfg.get("telegram_chat_id")
+    if not tg_token or not chat_id:
+        print("Error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Register command menu with Telegram
+    bot_commands = [
+        {"command": "threshold", "description": "Set alert threshold (watts)"},
+        {"command": "report", "description": "Set demand report threshold or disable"},
+        {"command": "mute", "description": "Silence all notifications"},
+        {"command": "unmute", "description": "Resume notifications"},
+        {"command": "status", "description": "Show current config + live demand"},
+        {"command": "help", "description": "List available commands"},
+    ]
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{tg_token}/setMyCommands",
+            json={"commands": bot_commands}, timeout=10)
+        resp.raise_for_status()
+        log.info("Registered bot command menu with Telegram")
+    except requests.RequestException as e:
+        log.warning("Failed to register bot commands: %s", e)
+
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    # Resume from last processed update
+    saved_offset = db.get_setting("telegram_update_offset")
+    offset = int(saved_offset) if saved_offset else None
+
+    log.info("Bot started, listening for commands (offset=%s)", offset)
+    print("Bot started. Listening for Telegram commands... (Ctrl+C to stop)")
+
+    while True:
+        try:
+            updates = get_telegram_updates(tg_token, offset=offset)
+        except requests.RequestException as e:
+            log.error("Failed to get updates: %s", e)
+            time.sleep(5)
+            continue
+
+        for update in updates:
+            update_id = update["update_id"]
+            offset = update_id + 1
+
+            msg = update.get("message", {})
+            msg_chat_id = str(msg.get("chat", {}).get("id", ""))
+            text = msg.get("text", "")
+
+            if msg_chat_id != chat_id:
+                log.warning("Ignoring message from unauthorized chat %s",
+                            msg_chat_id)
+                continue
+
+            if not text:
+                continue
+
+            # Check for pending command awaiting an argument
+            if not text.startswith("/"):
+                pending = db.get_setting("pending_command")
+                if pending and pending in ("threshold", "report"):
+                    db.set_setting("pending_command", "")
+                    text = f"/{pending} {text}"
+                else:
+                    continue
+
+            log.info("Received command: %s", text)
+            try:
+                handle_bot_command(cfg, db, text, chat_id, tg_token)
+            except requests.RequestException as e:
+                log.error("Failed to handle command: %s", e)
+
+        if updates:
+            db.set_setting("telegram_update_offset", str(offset))
 
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -439,6 +638,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp_export.add_argument("--output", "-o", type=str,
                            help="Output file path (default: octopus_export.json)")
 
+    # bot
+    sub.add_parser("bot", help="Run Telegram bot listener (long-running)")
+
     return parser
 
 
@@ -469,6 +671,7 @@ def main():
         "rates": cmd_rates,
         "cost": cmd_cost,
         "export": cmd_export,
+        "bot": cmd_bot,
     }
 
     try:

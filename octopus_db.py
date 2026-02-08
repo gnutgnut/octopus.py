@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS alerts (
     threshold     REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_consumption_start ON consumption(interval_start);
 CREATE INDEX IF NOT EXISTS idx_unit_rates_from ON unit_rates(valid_from);
 CREATE INDEX IF NOT EXISTS idx_standing_charges_from ON standing_charges(valid_from);
@@ -252,6 +257,21 @@ class OctopusDB:
             "SELECT * FROM alerts ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Settings methods ─────────────────────────────────────────────
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self.conn.commit()
 
     def export_all(self) -> dict:
         """Export all table data as a dict for JSON serialisation."""
