@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -343,6 +344,9 @@ def cmd_bot(cfg: dict, args):
     # Resume from last processed update
     saved_offset = db.get_setting("telegram_update_offset")
     offset = int(saved_offset) if saved_offset else None
+
+    # Convert SIGTERM to SystemExit so the finally block runs
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     log.info("Bot started, listening for commands (offset=%s)", offset)
     print("Bot started. Listening for Telegram commands... (Ctrl+C to stop)")
