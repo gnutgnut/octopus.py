@@ -200,6 +200,9 @@ def get_telegram_updates(token: str, offset: int | None = None,
 def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
                        tg_token: str):
     """Parse and dispatch a bot command, replying via Telegram."""
+    def reply(msg: str):
+        send_telegram(tg_token, chat_id, f"\U0001F419 {msg}")
+
     parts = text.strip().split(None, 1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
@@ -207,52 +210,51 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
     if "@" in cmd:
         cmd = cmd.split("@")[0]
     env_path = str(ENV_FILE)
-    db.set_setting("pending_command", "")
+    if db.get_setting("pending_command"):
+        db.set_setting("pending_command", "")
 
     if cmd == "/threshold":
         if not arg:
             db.set_setting("pending_command", "threshold")
-            send_telegram(tg_token, chat_id, "Enter threshold in watts:")
+            reply("Enter threshold in watts:")
             return
         try:
             watts = int(arg)
         except ValueError:
-            send_telegram(tg_token, chat_id, "Invalid number. Usage: /threshold <watts>")
+            reply("Invalid number. Usage: /threshold <watts>")
             return
         set_key(env_path, "OCTOPUS_ALERT_THRESHOLD", str(watts))
         cfg["alert_threshold"] = float(watts)
-        send_telegram(tg_token, chat_id, f"Alert threshold set to {watts}W")
+        reply(f"Alert threshold set to {watts}W")
 
     elif cmd == "/report":
         if not arg:
             db.set_setting("pending_command", "report")
-            send_telegram(tg_token, chat_id, "Enter threshold in watts (or 'off'):")
+            reply("Enter threshold in watts (or 'off'):")
             return
         if arg.lower() == "off":
             set_key(env_path, "TELEGRAM_REPORT_DEMAND", "false")
             cfg["telegram_report_demand"] = False
-            send_telegram(tg_token, chat_id, "Demand reporting disabled")
+            reply("Demand reporting disabled")
         else:
             try:
                 watts = int(arg)
             except ValueError:
-                send_telegram(tg_token, chat_id,
-                              "Invalid value. Usage: /report <watts|off>")
+                reply("Invalid value. Usage: /report <watts|off>")
                 return
             set_key(env_path, "OCTOPUS_REPORT_DEMAND_THRESHOLD", str(watts))
             set_key(env_path, "TELEGRAM_REPORT_DEMAND", "true")
             cfg["report_demand_threshold"] = float(watts)
             cfg["telegram_report_demand"] = True
-            send_telegram(tg_token, chat_id,
-                          f"Demand reporting enabled at {watts}W threshold")
+            reply(f"Demand reporting enabled at {watts}W threshold")
 
     elif cmd == "/mute":
         db.set_setting("muted", "true")
-        send_telegram(tg_token, chat_id, "Notifications muted")
+        reply("Notifications muted")
 
     elif cmd == "/unmute":
         db.set_setting("muted", "false")
-        send_telegram(tg_token, chat_id, "Notifications resumed")
+        reply("Notifications resumed")
 
     elif cmd == "/status":
         muted = db.get_setting("muted") == "true"
@@ -291,10 +293,10 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
         except Exception:
             pass
         lines.append(f"Version: {GIT_SHA}")
-        send_telegram(tg_token, chat_id, "\n".join(lines))
+        reply("\n".join(lines))
 
     elif cmd == "/help":
-        send_telegram(tg_token, chat_id, "\n".join([
+        reply("\n".join([
             "Available commands:",
             "  /threshold <watts> - set alert threshold",
             "  /report <watts|off> - set demand report threshold or disable",
@@ -305,7 +307,7 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
         ]))
 
     else:
-        send_telegram(tg_token, chat_id, "Unknown command. Send /help for usage.")
+        reply("Unknown command. Send /help for usage.")
 
 
 def cmd_bot(cfg: dict, args):
