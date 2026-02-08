@@ -328,7 +328,7 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
         muted = db.get_setting("muted") == "true"
         report = "on" if cfg.get("telegram_report_demand") else "off"
         lines = [
-            "Current config:",
+            f"ShedNet Octobot ({GIT_SHA})",
             f"  Alert threshold: {cfg['alert_threshold']:.0f}W",
             f"  Report demand: {report}",
             f"  Report threshold: {cfg['report_demand_threshold']:.0f}W",
@@ -347,20 +347,27 @@ def handle_bot_command(cfg: dict, db: OctopusDB, text: str, chat_id: str,
                         f"at {reading['readAt'][:16]}")
             except Exception as e:
                 log.warning("Failed to fetch demand for /status: %s", e)
-        # Cron jobs
+        # Cron jobs (human-readable summary)
         try:
             crontab = subprocess.check_output(
                 ["crontab", "-l"], stderr=subprocess.DEVNULL
             ).decode()
             cron_lines = [l.strip() for l in crontab.splitlines()
                           if "octopus.py" in l and not l.startswith("#")]
-            if cron_lines:
-                lines.append("Cron jobs:")
-                for cl in cron_lines:
-                    lines.append(f"  {cl}")
+            for cl in cron_lines:
+                if "demand" in cl:
+                    if cl.startswith("* "):
+                        lines.append("  Demand check: every minute")
+                    else:
+                        lines.append("  Demand check: scheduled")
+                elif "sync" in cl:
+                    if cl.startswith("*/"):
+                        mins = cl.split("/")[1].split()[0]
+                        lines.append(f"  Sync: every {mins} minutes")
+                    else:
+                        lines.append("  Sync: scheduled")
         except Exception:
             pass
-        lines.append(f"Version: {GIT_SHA}")
         reply("\n".join(lines))
 
     elif cmd == "/help":
@@ -420,7 +427,7 @@ def cmd_bot(cfg: dict, args):
 
     try:
         checks = run_selftest(cfg)
-        banner = f"\U0001F419 Bot online ({GIT_SHA})\n" + "\n".join(checks)
+        banner = f"\U0001F419 ShedNet Octobot online ({GIT_SHA})\n" + "\n".join(checks)
         send_telegram(tg_token, chat_id, banner)
     except requests.RequestException as e:
         log.warning("Failed to send startup banner: %s", e)
@@ -469,7 +476,7 @@ def cmd_bot(cfg: dict, args):
                 db.set_setting("telegram_update_offset", str(offset))
     finally:
         try:
-            send_telegram(tg_token, chat_id, "\U0001F419 Bot shutting down")
+            send_telegram(tg_token, chat_id, "\U0001F419 ShedNet Octobot shutting down")
         except Exception:
             pass
         db.close()
