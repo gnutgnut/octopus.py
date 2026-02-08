@@ -47,7 +47,9 @@ def load_config(db_override: str | None = None) -> dict:
         "log_level": os.getenv("OCTOPUS_LOG_LEVEL", "INFO"),
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID"),
-        "alert_threshold": float(os.getenv("OCTOPUS_ALERT_THRESHOLD", "1.0")),
+        "alert_threshold": float(os.getenv("OCTOPUS_ALERT_THRESHOLD", "1000")),
+        "device_id": os.getenv("OCTOPUS_DEVICE_ID"),
+        "telegram_report_demand": os.getenv("TELEGRAM_REPORT_DEMAND", "true").lower() == "true",
     }
     return cfg
 
@@ -100,38 +102,45 @@ def send_telegram(token: str, chat_id: str, message: str):
     log.info("Telegram message sent to chat %s", chat_id)
 
 
-def check_usage_alerts(cfg: dict, db: OctopusDB):
-    """Check if daily usage crossed the threshold and send a Telegram alert."""
-    token = cfg.get("telegram_bot_token")
+def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
+    """Check live demand from Home Mini and alert on threshold crossings."""
+    tg_token = cfg.get("telegram_bot_token")
     chat_id = cfg.get("telegram_chat_id")
-    if not token or not chat_id:
+    if not tg_token or not chat_id:
+        return
+
+    device_id = cfg.get("device_id")
+    if not device_id:
+        log.debug("No OCTOPUS_DEVICE_ID configured, skipping live demand check")
         return
 
     threshold = cfg["alert_threshold"]
 
-    # Get daily consumption for the last 3 complete days (exclude today)
-    period_from = days_ago(3)
-    period_to = days_ago(0)  # start of today = end of yesterday
-    daily = db.get_consumption_grouped(period_from, period_to, group="day")
-
-    if len(daily) < 2:
-        log.debug("Not enough daily data for alert check (%d days)", len(daily))
+    # Fetch live demand via GraphQL
+    try:
+        gql_token = api.get_graphql_token()
+        reading = api.get_live_demand(gql_token, device_id)
+    except (OctopusAPIError, requests.RequestException) as e:
+        log.error("Failed to get live demand: %s", e)
         return
 
-    prev_day = daily[-2]
-    curr_day = daily[-1]
-    prev_kwh = prev_day["total_kwh"]
-    curr_kwh = curr_day["total_kwh"]
-
-    # Determine direction of transition
-    if prev_kwh < threshold and curr_kwh >= threshold:
-        direction = "high"
-    elif prev_kwh >= threshold and curr_kwh < threshold:
-        direction = "low"
-    else:
-        log.debug("No usage transition: %.2f -> %.2f (threshold %.2f)",
-                  prev_kwh, curr_kwh, threshold)
+    if reading is None:
+        log.debug("No live telemetry data available")
         return
+
+    demand = float(reading["demand"])
+    read_at = reading["readAt"]
+
+    # Optional: always report current demand
+    if cfg.get("telegram_report_demand"):
+        status_msg = f"Demand: {demand:.0f}W at {read_at[:16]}"
+        try:
+            send_telegram(tg_token, chat_id, status_msg)
+        except requests.RequestException as e:
+            log.error("Failed to send demand status: %s", e)
+
+    # Determine current state
+    direction = "high" if demand >= threshold else "low"
 
     # Skip if the last alert was already this direction
     last = db.last_alert()
@@ -139,17 +148,18 @@ def check_usage_alerts(cfg: dict, db: OctopusDB):
         log.debug("Skipping duplicate %s alert", direction)
         return
 
-    # Build and send message
+    prev_demand = last["curr_kwh"] if last else 0.0
+
+    # Build and send transition alert
     arrow = "\u2b06\ufe0f" if direction == "high" else "\u2b07\ufe0f"
     label = "High" if direction == "high" else "Low"
     msg = (f"{arrow} {label} usage alert\n"
-           f"{prev_day['period']}: {prev_kwh:.2f} kWh\n"
-           f"{curr_day['period']}: {curr_kwh:.2f} kWh\n"
-           f"Threshold: {threshold:.1f} kWh")
+           f"Demand: {demand:.0f}W at {read_at[:16]}\n"
+           f"Threshold: {threshold:.0f}W")
 
     try:
-        send_telegram(token, chat_id, msg)
-        db.log_alert(direction, prev_kwh, curr_kwh, threshold)
+        send_telegram(tg_token, chat_id, msg)
+        db.log_alert(direction, prev_demand, demand, threshold)
     except requests.RequestException as e:
         log.error("Failed to send Telegram alert: %s", e)
 
@@ -233,7 +243,7 @@ def cmd_sync(cfg: dict, args):
     if not args.quiet:
         print("Sync complete.")
 
-    check_usage_alerts(cfg, db)
+    check_usage_alerts(cfg, db, api)
 
     db.close()
 

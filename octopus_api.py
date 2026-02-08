@@ -1,4 +1,4 @@
-"""Octopus Energy REST API client."""
+"""Octopus Energy REST + GraphQL API client."""
 
 import re
 import logging
@@ -9,6 +9,7 @@ import requests
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.octopus.energy/v1"
+GQL_URL = "https://api.octopus.energy/v1/graphql/"
 
 # E-1R-VAR-22-11-01-C  ->  VAR-22-11-01
 # E-1R-AGILE-FLEX-22-11-25-C  ->  AGILE-FLEX-22-11-25
@@ -137,3 +138,64 @@ class OctopusAPI:
         if period_to:
             params["period_to"] = period_to
         return self._get_paginated(url, params)
+
+    # ── GraphQL (Home Mini live telemetry) ────────────────────────────
+
+    def get_graphql_token(self) -> str:
+        """Obtain a Kraken JWT token using the REST API key."""
+        query = """
+        mutation obtainKrakenToken($input: ObtainJSONWebTokenInput!) {
+            obtainKrakenToken(input: $input) { token }
+        }
+        """
+        resp = requests.post(GQL_URL, json={
+            "query": query,
+            "variables": {"input": {"APIKey": self.session.auth[0]}},
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        errors = data.get("errors")
+        if errors:
+            raise OctopusAPIError(f"GraphQL error: {errors[0].get('message', errors)}")
+        token = data["data"]["obtainKrakenToken"]["token"]
+        log.debug("Obtained GraphQL token (%d chars)", len(token))
+        return token
+
+    def get_live_demand(self, gql_token: str, device_id: str) -> dict | None:
+        """Query last 5 min of smartMeterTelemetry, return latest reading.
+
+        Returns dict with keys 'demand' (watts) and 'readAt' (ISO timestamp),
+        or None if no data available.
+        """
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(minutes=5)).isoformat()
+        end = now.isoformat()
+
+        query = """
+        query smartMeterTelemetry($deviceId: String!, $start: DateTime!, $end: DateTime!) {
+            smartMeterTelemetry(deviceId: $deviceId, grouping: TEN_SECONDS, start: $start, end: $end) {
+                readAt
+                demand
+                consumptionDelta
+            }
+        }
+        """
+        resp = requests.post(GQL_URL, json={
+            "query": query,
+            "variables": {"deviceId": device_id, "start": start, "end": end},
+        }, headers={"Authorization": gql_token}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        errors = data.get("errors")
+        if errors:
+            raise OctopusAPIError(f"GraphQL error: {errors[0].get('message', errors)}")
+
+        readings = data["data"]["smartMeterTelemetry"]
+        if not readings:
+            log.debug("No live telemetry data in last 5 minutes")
+            return None
+
+        latest = readings[-1]
+        demand = float(latest["demand"])
+        log.debug("Live demand: %sW at %s", demand, latest["readAt"])
+        return {"demand": demand, "readAt": latest["readAt"]}
