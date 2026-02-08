@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Octopus Energy Electricity Tracker - CLI entry point."""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv, set_key
+from tabulate import tabulate
+
+from octopus_api import OctopusAPI, OctopusAPIError, extract_product_code
+from octopus_db import OctopusDB
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ENV_FILE = PROJECT_DIR / ".env"
+
+log = logging.getLogger("octopus")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def setup_logging(quiet: bool = False, level: str = "INFO"):
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    if quiet:
+        # Cron mode: only warnings/errors to stderr
+        logging.basicConfig(level=logging.WARNING, format=fmt, stream=sys.stderr)
+    else:
+        logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
+                            format=fmt, stream=sys.stderr)
+
+
+def load_config(db_override: str | None = None) -> dict:
+    load_dotenv(ENV_FILE)
+    cfg = {
+        "api_key": os.getenv("OCTOPUS_API_KEY"),
+        "account": os.getenv("OCTOPUS_ACCOUNT"),
+        "mpan": os.getenv("OCTOPUS_MPAN"),
+        "serial": os.getenv("OCTOPUS_SERIAL"),
+        "tariff_code": os.getenv("OCTOPUS_TARIFF_CODE"),
+        "db_path": db_override or os.getenv("OCTOPUS_DB_PATH",
+                                             str(PROJECT_DIR / "octopus.db")),
+        "log_level": os.getenv("OCTOPUS_LOG_LEVEL", "INFO"),
+    }
+    return cfg
+
+
+def require_config(cfg: dict, *keys: str):
+    missing = [k for k in keys if not cfg.get(k)]
+    if missing:
+        names = ", ".join(f"OCTOPUS_{k.upper()}" for k in missing)
+        print(f"Error: Missing config: {names}", file=sys.stderr)
+        print("Run 'octopus.py init' or set values in .env", file=sys.stderr)
+        sys.exit(1)
+
+
+def days_ago(n: int) -> str:
+    dt = datetime.now(timezone.utc) - timedelta(days=n)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def output_result(data, headers: list[str] | None = None, as_json: bool = False):
+    """Print data as a table or JSON."""
+    if as_json:
+        print(json.dumps(data, indent=2, default=str))
+    elif isinstance(data, list) and data:
+        if headers:
+            rows = [[row.get(h, "") for h in headers] for row in data]
+            print(tabulate(rows, headers=headers, tablefmt="simple",
+                           floatfmt=".4f"))
+        else:
+            print(tabulate([d.values() for d in data],
+                           headers=data[0].keys(), tablefmt="simple",
+                           floatfmt=".4f"))
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            print(f"  {k}: {v}")
+    else:
+        print("No data.")
+
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+def cmd_init(cfg: dict, args):
+    """Fetch account details and write MPAN/serial/tariff to .env."""
+    require_config(cfg, "api_key", "account")
+    api = OctopusAPI(cfg["api_key"])
+
+    print(f"Fetching account details for {cfg['account']}...")
+    details = api.get_electricity_details(cfg["account"])
+
+    print(f"  MPAN:   {details['mpan']}")
+    print(f"  Serial: {details['serial']}")
+    print(f"  Tariff: {details['tariff_code']}")
+
+    # Write to .env
+    env_path = str(ENV_FILE)
+    set_key(env_path, "OCTOPUS_MPAN", details["mpan"])
+    set_key(env_path, "OCTOPUS_SERIAL", details["serial"])
+    set_key(env_path, "OCTOPUS_TARIFF_CODE", details["tariff_code"])
+    print(f"\nWritten to {env_path}")
+
+
+def cmd_sync(cfg: dict, args):
+    """Fetch consumption, rates, and standing charges from API."""
+    require_config(cfg, "api_key", "mpan", "serial", "tariff_code")
+    api = OctopusAPI(cfg["api_key"])
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    # Determine date range
+    if args.from_date:
+        period_from = args.from_date
+    elif args.days:
+        period_from = days_ago(args.days)
+    else:
+        # Smart resume: check last sync, default 30 days
+        last = db.last_sync("consumption")
+        if last and last.get("period_to"):
+            period_from = last["period_to"]
+            log.info("Resuming from last sync: %s", period_from)
+        else:
+            period_from = days_ago(30)
+
+    period_to = args.to_date if args.to_date else now_iso()
+
+    if not args.quiet:
+        print(f"Syncing from {period_from} to {period_to}")
+
+    # Consumption
+    if not args.quiet:
+        print("  Fetching consumption...")
+    records = api.get_consumption(cfg["mpan"], cfg["serial"],
+                                  period_from, period_to)
+    count = db.upsert_consumption(records)
+    db.log_sync("consumption", period_from, period_to, count)
+    if not args.quiet:
+        print(f"  -> {count} consumption records")
+
+    # Unit rates
+    if not args.quiet:
+        print("  Fetching unit rates...")
+    rates = api.get_unit_rates(cfg["tariff_code"], period_from, period_to)
+    rcount = db.upsert_unit_rates(rates)
+    db.log_sync("unit_rates", period_from, period_to, rcount)
+    if not args.quiet:
+        print(f"  -> {rcount} unit rate records")
+
+    # Standing charges
+    if not args.quiet:
+        print("  Fetching standing charges...")
+    charges = api.get_standing_charges(cfg["tariff_code"], period_from, period_to)
+    scount = db.upsert_standing_charges(charges)
+    db.log_sync("standing_charges", period_from, period_to, scount)
+    if not args.quiet:
+        print(f"  -> {scount} standing charge records")
+
+    if not args.quiet:
+        print("Sync complete.")
+
+    db.close()
+
+
+def cmd_usage(cfg: dict, args):
+    """Show consumption data from DB."""
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    days = args.days or 7
+    period_from = days_ago(days)
+    period_to = now_iso()
+
+    if args.group:
+        data = db.get_consumption_grouped(period_from, period_to, args.group)
+        headers = ["period", "total_kwh", "readings"]
+    else:
+        data = db.get_consumption(period_from, period_to)
+        headers = ["interval_start", "interval_end", "kwh"]
+
+    if not data:
+        print("No consumption data. Run 'sync' first.")
+    else:
+        output_result(data, headers=headers, as_json=args.json)
+
+    db.close()
+
+
+def cmd_rates(cfg: dict, args):
+    """Show unit rates from DB."""
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    days = args.days or 7
+    period_from = days_ago(days)
+    period_to = now_iso()
+
+    data = db.get_unit_rates(period_from, period_to)
+    if not data:
+        print("No rate data. Run 'sync' first.")
+    else:
+        headers = ["valid_from", "valid_to", "value_exc_vat", "value_inc_vat"]
+        output_result(data, headers=headers, as_json=args.json)
+
+    db.close()
+
+
+def cmd_cost(cfg: dict, args):
+    """Calculate costs: consumption x unit rates + standing charges."""
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    days = args.days or 7
+    group = args.group or "day"
+    period_from = days_ago(days)
+    period_to = now_iso()
+
+    cost_data = db.get_cost_data(period_from, period_to, group)
+    if not cost_data:
+        print("No cost data. Run 'sync' first.")
+        db.close()
+        return
+
+    # Add standing charges per period
+    for row in cost_data:
+        period = row["period"]
+        if group == "day":
+            sc = db.get_standing_charge_for_date(period)
+            row["standing_pence"] = sc or 0.0
+        elif group == "week":
+            # Approximate: 7 days per week
+            sc = db.get_standing_charge_for_date(period_from[:10])
+            row["standing_pence"] = (sc or 0.0) * 7
+        elif group == "month":
+            # Use first of month, approximate 30 days
+            sc = db.get_standing_charge_for_date(period + "-01")
+            row["standing_pence"] = (sc or 0.0) * 30
+
+        usage_cost = row["usage_cost_pence"] or 0.0
+        standing = row["standing_pence"]
+        row["total_pence"] = usage_cost + standing
+        row["total_gbp"] = row["total_pence"] / 100.0
+
+    headers = ["period", "total_kwh", "usage_cost_pence", "standing_pence",
+               "total_pence", "total_gbp"]
+
+    if args.json:
+        output_result(cost_data, as_json=True)
+    else:
+        # Format for display
+        display_data = []
+        for row in cost_data:
+            display_data.append({
+                "period": row["period"],
+                "kWh": f"{row['total_kwh']:.2f}",
+                "usage (p)": f"{row['usage_cost_pence'] or 0:.2f}",
+                "standing (p)": f"{row['standing_pence']:.2f}",
+                "total (p)": f"{row['total_pence']:.2f}",
+                "total (£)": f"{row['total_gbp']:.2f}",
+            })
+        print(tabulate([d.values() for d in display_data],
+                        headers=display_data[0].keys(), tablefmt="simple"))
+
+    db.close()
+
+
+def cmd_export(cfg: dict, args):
+    """Export all DB data to JSON."""
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    data = db.export_all()
+    data["exported_at"] = now_iso()
+
+    output_path = args.output or "octopus_export.json"
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    print(f"Exported to {output_path}")
+    print(f"  consumption:      {len(data['consumption'])} records")
+    print(f"  unit_rates:       {len(data['unit_rates'])} records")
+    print(f"  standing_charges: {len(data['standing_charges'])} records")
+    print(f"  sync_log:         {len(data['sync_log'])} entries")
+
+    db.close()
+
+
+# ── CLI argument parser ──────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="octopus.py",
+        description="Octopus Energy Electricity Tracker",
+    )
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress non-error output (cron-friendly)")
+    parser.add_argument("--json", "-j", action="store_true",
+                        help="Output as JSON")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Path to SQLite database")
+
+    sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # init
+    sub.add_parser("init", help="Fetch account details, populate .env")
+
+    # sync
+    sp_sync = sub.add_parser("sync", help="Fetch data from API, store in DB")
+    sp_sync.add_argument("--days", type=int, default=None,
+                         help="Number of days to sync (default: smart resume or 30)")
+    sp_sync.add_argument("--from", dest="from_date", type=str,
+                         help="Start date (ISO 8601)")
+    sp_sync.add_argument("--to", dest="to_date", type=str,
+                         help="End date (ISO 8601)")
+
+    # usage
+    sp_usage = sub.add_parser("usage", help="Show consumption data")
+    sp_usage.add_argument("--days", type=int, default=None,
+                          help="Number of days (default: 7)")
+    sp_usage.add_argument("--group", choices=["day", "week", "month"],
+                          help="Group by period")
+
+    # rates
+    sp_rates = sub.add_parser("rates", help="Show unit rates")
+    sp_rates.add_argument("--days", type=int, default=None,
+                          help="Number of days (default: 7)")
+
+    # cost
+    sp_cost = sub.add_parser("cost", help="Calculate costs")
+    sp_cost.add_argument("--days", type=int, default=None,
+                         help="Number of days (default: 7)")
+    sp_cost.add_argument("--group", choices=["day", "week", "month"],
+                         default=None, help="Group by period (default: day)")
+
+    # export
+    sp_export = sub.add_parser("export", help="Export all data to JSON")
+    sp_export.add_argument("--output", "-o", type=str,
+                           help="Output file path (default: octopus_export.json)")
+
+    return parser
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    cfg = load_config(db_override=args.db)
+    setup_logging(quiet=args.quiet, level=cfg["log_level"])
+
+    # Propagate --quiet and --json to args for commands that need them
+    if not hasattr(args, "quiet"):
+        args.quiet = False
+    if not hasattr(args, "json"):
+        args.json = False
+
+    commands = {
+        "init": cmd_init,
+        "sync": cmd_sync,
+        "usage": cmd_usage,
+        "rates": cmd_rates,
+        "cost": cmd_cost,
+        "export": cmd_export,
+    }
+
+    try:
+        commands[args.command](cfg, args)
+    except OctopusAPIError as e:
+        log.error("API error: %s", e)
+        if not args.quiet:
+            print(f"API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        log.error("Unexpected error: %s", e, exc_info=True)
+        if not args.quiet:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
