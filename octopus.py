@@ -394,6 +394,18 @@ def cmd_bot(cfg: dict, args):
               file=sys.stderr)
         sys.exit(1)
 
+    # Wait for network connectivity (DNS) before proceeding
+    for attempt in range(1, 31):
+        try:
+            requests.head(f"https://api.telegram.org/bot{tg_token}/getMe",
+                          timeout=5)
+            break
+        except requests.RequestException:
+            log.info("Waiting for network... (%d/30)", attempt)
+            time.sleep(2)
+    else:
+        log.warning("Network not ready after 60s, starting anyway")
+
     # Register command menu with Telegram
     bot_commands = [
         {"command": "threshold", "description": "Set alert threshold (watts)"},
