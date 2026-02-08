@@ -590,6 +590,71 @@ def cmd_demand(cfg: dict, args):
     db.close()
 
 
+def cmd_motd(cfg: dict, args):
+    """Generate a compact MOTD status summary."""
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    muted = db.get_setting("muted") == "true"
+    report = "on" if cfg.get("telegram_report_demand") else "off"
+
+    lines = [
+        f"\U0001F419 ShedNet Octobot ({GIT_SHA})",
+    ]
+
+    # Live demand
+    device_id = cfg.get("device_id")
+    if device_id and cfg.get("api_key"):
+        try:
+            api = OctopusAPI(cfg["api_key"])
+            gql_token = api.get_graphql_token()
+            reading = api.get_live_demand(gql_token, device_id)
+            if reading:
+                demand = float(reading["demand"])
+                ts = reading["readAt"][:16].replace("T", " ")
+                bar = "\u2588" * max(1, min(20, int(demand / 200)))
+                lines.append(f"  \u26a1 {demand:.0f}W {bar}  ({ts})")
+            else:
+                lines.append("  \u26a1 No telemetry data")
+        except Exception as e:
+            lines.append(f"  \u26a1 API error: {e}")
+    else:
+        lines.append("  \u26a1 No device configured")
+
+    # Today's usage from DB
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_data = db.get_consumption_grouped(today_start, now_iso(), "day")
+    if today_data:
+        kwh = today_data[0]["total_kwh"]
+        lines.append(f"  \U0001F4CA Today: {kwh:.2f} kWh")
+
+    # Config summary
+    lines.append(f"  Alert: {cfg['alert_threshold']:.0f}W | "
+                 f"Report: {report} | "
+                 f"Muted: {'yes' if muted else 'no'}")
+
+    # System health (compact)
+    health = []
+    try:
+        temp_str = Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()
+        temp_c = int(temp_str) / 1000.0
+        health.append(f"CPU {temp_c:.0f}\u00b0C")
+    except Exception:
+        pass
+    try:
+        st = os.statvfs("/")
+        free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+        health.append(f"Disk {free_gb:.1f}GB free")
+    except Exception:
+        pass
+    if health:
+        lines.append(f"  {' | '.join(health)}")
+
+    print("\n".join(lines))
+    db.close()
+
+
 def cmd_usage(cfg: dict, args):
     """Show consumption data from DB."""
     db = OctopusDB(cfg["db_path"])
@@ -770,6 +835,9 @@ def build_parser() -> argparse.ArgumentParser:
     # bot
     sub.add_parser("bot", help="Run Telegram bot listener (long-running)")
 
+    # motd
+    sub.add_parser("motd", help="Print compact status for /etc/update-motd.d")
+
     return parser
 
 
@@ -801,6 +869,7 @@ def main():
         "cost": cmd_cost,
         "export": cmd_export,
         "bot": cmd_bot,
+        "motd": cmd_motd,
     }
 
     try:
