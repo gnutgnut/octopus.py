@@ -248,6 +248,18 @@ def cmd_sync(cfg: dict, args):
     db.close()
 
 
+def cmd_demand(cfg: dict, args):
+    """Check live demand from Home Mini and send alerts."""
+    require_config(cfg, "api_key")
+    api = OctopusAPI(cfg["api_key"])
+    db = OctopusDB(cfg["db_path"])
+    db.init_schema()
+
+    check_usage_alerts(cfg, db, api)
+
+    db.close()
+
+
 def cmd_usage(cfg: dict, args):
     """Show consumption data from DB."""
     db = OctopusDB(cfg["db_path"])
@@ -398,6 +410,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp_sync.add_argument("--to", dest="to_date", type=str,
                          help="End date (ISO 8601)")
 
+    # demand
+    sub.add_parser("demand", help="Check live demand and send alerts (lightweight, safe for 1-min cron)")
+
     # usage
     sp_usage = sub.add_parser("usage", help="Show consumption data")
     sp_usage.add_argument("--days", type=int, default=None,
@@ -447,6 +462,7 @@ def main():
     commands = {
         "init": cmd_init,
         "sync": cmd_sync,
+        "demand": cmd_demand,
         "usage": cmd_usage,
         "rates": cmd_rates,
         "cost": cmd_cost,
