@@ -133,7 +133,8 @@ def check_usage_alerts(cfg: dict, db: OctopusDB, api: OctopusAPI):
 
     # Optional: always report current demand
     if cfg.get("telegram_report_demand"):
-        status_msg = f"Demand: {demand:.0f}W at {read_at[:16]}"
+        warn = "\u26a0\ufe0f " if demand >= 3000 else ""
+        status_msg = f"{warn}Demand: {demand:.0f}W at {read_at[:16]}"
         try:
             send_telegram(tg_token, chat_id, status_msg)
         except requests.RequestException as e:

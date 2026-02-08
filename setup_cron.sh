@@ -5,8 +5,8 @@
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-DEMAND="* * * * * python3 ${DIR}/octopus.py demand -q"
-SYNC="*/30 * * * * python3 ${DIR}/octopus.py sync -q"
+DEMAND="* * * * * python3 ${DIR}/octopus.py -q demand"
+SYNC="*/30 * * * * python3 ${DIR}/octopus.py -q sync"
 
 # Remove any existing octopus.py entries, then append new ones
 (crontab -l 2>/dev/null | grep -v "octopus.py" ; echo "$DEMAND" ; echo "$SYNC") | crontab -
