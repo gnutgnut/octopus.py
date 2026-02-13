@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Octopus Energy Electricity Tracker - CLI entry point."""
+"""Octopus Energy Electricity Tracker - CLI entry point"""
 
 import argparse
 import json
