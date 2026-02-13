@@ -59,6 +59,12 @@ if [[ -n "$BAD" ]]; then
     exit 1
 fi
 
+# Re-apply cron if setup_cron.sh was modified
+if git diff --name-only "$LOCAL" HEAD | grep -q setup_cron.sh; then
+    log "setup_cron.sh changed, re-applying cron jobs"
+    bash "$DIR/setup_cron.sh" 2>> "$LOGFILE" || true
+fi
+
 # Restart bot service
 if ! systemctl --user restart octopus-bot >> "$LOGFILE" 2>&1; then
     log "ERROR: bot restart failed"
